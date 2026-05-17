@@ -21,23 +21,26 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # We only ever touch tracker files, so a shallow clone is fine.
+          fetch-depth: 1
+          persist-credentials: true
 
       - name: Run updater
         id: updater
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python .github/scripts/update_clang.py
+        # ubuntu-latest ships a recent python3, no need for actions/setup-python.
+        run: python3 .github/scripts/update_clang.py
 
       - name: Commit and push changes
         if: steps.updater.outputs.changed == 'true'
+        env:
+          UPDATED: ${{ steps.updater.outputs.updated_branches }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -47,7 +50,16 @@ jobs:
             echo "No staged changes."
             exit 0
           fi
-          # Use the most recent build date in the commit message for visibility.
           latest_build=$(cat Clang-*-lastbuild.txt | sort -u | tail -n1)
-          git commit -m "ci: sync ZyCromerZ/Clang trackers (${latest_build})"
-          git push
+          git commit -m "ci: sync ZyCromerZ/Clang trackers (${latest_build})" \
+                     -m "Updated branches: ${UPDATED:-unknown}"
+          # Retry-on-conflict push: rebase on top of any concurrent commit.
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "push failed, retrying ($i)..."
+            git pull --rebase --autostash
+          done
+          echo "::error::push failed after retries"
+          exit 1
