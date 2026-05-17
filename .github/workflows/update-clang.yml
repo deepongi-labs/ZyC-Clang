@@ -1,0 +1,53 @@
+name: Update Clang Trackers
+
+on:
+  schedule:
+    # Every 6 hours.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/update-clang.yml"
+      - ".github/scripts/update_clang.py"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-clang
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run updater
+        id: updater
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/scripts/update_clang.py
+
+      - name: Commit and push changes
+        if: steps.updater.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Clang-*-commit.txt Clang-*-lastbuild.txt Clang-*-link.txt
+          if git diff --cached --quiet; then
+            echo "No staged changes."
+            exit 0
+          fi
+          # Use the most recent build date in the commit message for visibility.
+          latest_build=$(cat Clang-*-lastbuild.txt | sort -u | tail -n1)
+          git commit -m "ci: sync ZyCromerZ/Clang trackers (${latest_build})"
+          git push
