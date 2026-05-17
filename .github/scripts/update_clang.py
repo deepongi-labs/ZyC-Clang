@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """
-Update the Clang-*-{commit,lastbuild,link}.txt tracker files in this repo
-based on the latest releases from https://github.com/ZyCromerZ/Clang.
+Sync tracker files for https://github.com/ZyCromerZ/Clang releases.
 
-Branches tracked:
-    Clang-10 .. Clang-16  -> tags like "16.0.6-20260510-release"
-    Clang-main            -> tags like "23.0.0git-20260130-release"
+Outputs (all stdlib, no deps):
 
-For each branch we look for the most recent release whose tag matches the
-branch's pattern and, if its build date is newer than what is currently
-recorded, rewrite the three tracker files.
+  Clang-{N}-commit.txt        upstream LLVM commit SHA
+  Clang-{N}-lastbuild.txt     YYYYMMDD build date
+  Clang-{N}-link.txt          .tar.gz download URL
+  Clang-{N}-sha256.txt        sha256 digest (lower hex, 64 chars)
 
-Stdlib only.
+  Pixel-8-{branch}-*.txt      same four files, but pointing at the LLVM
+                              major appropriate for that AOSP kernel branch
+                              (with fallback to a newer major if the preferred
+                              one is not currently published upstream).
+
+Branches:
+    Clang-10 .. Clang-23, Clang-main
+    Pixel-8-android14, Pixel-8-android15, Pixel-8-android16
+
+Tag patterns recognised:
+    "16.0.6-20260510-release"        -> stable point release (10..16)
+    "23.0.0git-20260130-release"     -> rolling main / 17+ (per-major)
 """
 from __future__ import annotations
 
@@ -28,19 +37,53 @@ from typing import Iterable, Optional
 UPSTREAM = "ZyCromerZ/Clang"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Branch -> regex matching the upstream tag for that branch.
-BRANCH_PATTERNS: dict[str, re.Pattern[str]] = {
-    **{
-        f"Clang-{n}": re.compile(rf"^{n}\.\d+\.\d+-(\d{{8}})-release$")
-        for n in range(10, 17)
-    },
-    "Clang-main": re.compile(r"^\d+\.\d+\.\d+git-(\d{8})-release$"),
+# --- branch / tag patterns -------------------------------------------------
+
+# Stable point releases like "16.0.6-20260510-release".
+STABLE_TAG = re.compile(r"^(\d+)\.\d+\.\d+-(\d{8})-release$")
+# Rolling builds like "23.0.0git-20260130-release".
+GIT_TAG = re.compile(r"^(\d+)\.\d+\.\d+git-(\d{8})-release$")
+
+
+def stable_pattern(major: int) -> re.Pattern[str]:
+    return re.compile(rf"^{major}\.\d+\.\d+-(\d{{8}})-release$")
+
+
+def git_pattern(major: int) -> re.Pattern[str]:
+    return re.compile(rf"^{major}\.\d+\.\d+git-(\d{{8}})-release$")
+
+
+# Numbered branches we publish trackers for.
+# 10..16 historically shipped as stable point releases.
+# 17+ ship only as rolling git builds, so we accept either shape.
+BRANCH_PATTERNS: dict[str, list[re.Pattern[str]]] = {}
+for n in range(10, 17):
+    BRANCH_PATTERNS[f"Clang-{n}"] = [stable_pattern(n)]
+for n in range(17, 24):
+    BRANCH_PATTERNS[f"Clang-{n}"] = [stable_pattern(n), git_pattern(n)]
+# Generic "main" tracker = whichever rolling git build is newest overall.
+BRANCH_PATTERNS["Clang-main"] = [re.compile(r"^\d+\.\d+\.\d+git-(\d{8})-release$")]
+
+# --- Pixel 8 kernel aliases ------------------------------------------------
+#
+# Google's pinned clangs for Pixel 8 (shusky, Tensor G3) per AOSP kernel branch:
+#   android14-gs-shusky-5.15  -> clang-r487747c (LLVM 17)
+#   android15-gs-shusky-6.1   -> clang-r522817  (LLVM 18)
+#   android16-gs-shusky-6.1   -> clang-r563880c (LLVM 19)
+# Newer clang typically builds these kernels fine, so each alias has a
+# preference list and falls back to the next entry if the preferred LLVM major
+# is not currently published by ZyCromerZ/Clang.
+PIXEL8_ALIASES: dict[str, list[int]] = {
+    "Pixel-8-android14": [17, 18, 19],
+    "Pixel-8-android15": [18, 19, 20],
+    "Pixel-8-android16": [19, 20, 21],
 }
 
 LLVM_COMMIT_RE = re.compile(
     r"https?://github\.com/llvm/llvm-project[/\s]+([0-9a-f]{7,40})",
     re.IGNORECASE,
 )
+SHA256_RE = re.compile(r"^sha256:([0-9a-f]{64})$", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -62,11 +105,8 @@ def _request(url: str) -> bytes:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
-            # 422 = paged past the API hard cap; not transient. Re-raise so the
-            # caller can decide to stop pagination cleanly.
             if e.code == 422:
                 raise
-            # 5xx and 403 (rate-limit) are worth retrying.
             if e.code >= 500 or e.code == 403:
                 last_err = e
             else:
@@ -83,13 +123,8 @@ def _request(url: str) -> bytes:
     raise last_err
 
 
-def fetch_releases(
-    needed_branches: set[str], max_pages: int = 5
-) -> list[dict]:
-    """Stream paginated releases, stopping once every needed branch has at
-    least one matching tag (newest-first ordering means later pages can only
-    have older releases)."""
-    seen: set[str] = set()
+def fetch_releases(max_pages: int = 5) -> list[dict]:
+    """Stream paginated releases newest-first; cap at max_pages."""
     out: list[dict] = []
     for page in range(1, max_pages + 1):
         url = (
@@ -107,15 +142,6 @@ def fetch_releases(
         if not batch:
             break
         out.extend(batch)
-        # Track which branches have at least one match in what we've seen so far.
-        for rel in batch:
-            tag = rel.get("tag_name", "")
-            for branch, pat in BRANCH_PATTERNS.items():
-                if branch not in seen and pat.match(tag):
-                    seen.add(branch)
-        if needed_branches.issubset(seen):
-            print(f"[fetch] all branches resolved by page {page}")
-            break
         if len(batch) < 100:
             break
     return out
@@ -125,14 +151,15 @@ def fetch_releases(
 # Release parsing
 # ---------------------------------------------------------------------------
 
-def pick_tarball(assets: Iterable[dict]) -> Optional[str]:
-    for a in assets:
+def pick_clang_asset(assets: Iterable[dict]) -> Optional[dict]:
+    asset_list = list(assets)
+    for a in asset_list:
         name = a.get("name", "")
         if name.endswith(".tar.gz") and name.lower().startswith("clang-"):
-            return a.get("browser_download_url")
-    for a in assets:
+            return a
+    for a in asset_list:
         if a.get("name", "").endswith(".tar.gz"):
-            return a.get("browser_download_url")
+            return a
     return None
 
 
@@ -141,6 +168,14 @@ def extract_llvm_commit(body: Optional[str]) -> Optional[str]:
         return None
     m = LLVM_COMMIT_RE.search(body)
     return m.group(1) if m else None
+
+
+def extract_sha256(asset: dict) -> Optional[str]:
+    digest = asset.get("digest")
+    if not digest:
+        return None
+    m = SHA256_RE.match(digest)
+    return m.group(1).lower() if m else None
 
 
 def read_text(path: Path) -> str:
@@ -155,57 +190,69 @@ def write_text(path: Path, value: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-branch update
+# Resolution
 # ---------------------------------------------------------------------------
 
-def update_branch(branch: str, releases: list[dict]) -> Optional[dict]:
-    """Update tracker files for one branch.
-
-    Returns a summary dict (always, for reporting), with a `changed` boolean.
-    """
-    pattern = BRANCH_PATTERNS[branch]
+def best_match(
+    releases: list[dict], patterns: Iterable[re.Pattern[str]]
+) -> Optional[tuple[str, dict]]:
+    """Return the (build_date, release) for the newest release matching any
+    of the given patterns. Skips drafts and prereleases."""
+    pats = list(patterns)
     best: Optional[tuple[str, dict]] = None
     for rel in releases:
         if rel.get("draft") or rel.get("prerelease"):
             continue
         tag = rel.get("tag_name", "")
-        m = pattern.match(tag)
-        if not m:
-            continue
-        build_date = m.group(1)
-        if best is None or build_date > best[0]:
-            best = (build_date, rel)
+        for p in pats:
+            m = p.match(tag)
+            if m:
+                build_date = m.group(1) if p.groups == 1 else m.groups()[-1]
+                if best is None or build_date > best[0]:
+                    best = (build_date, rel)
+                break
+    return best
 
-    if best is None:
+
+def write_tracker(
+    prefix: str, build_date: str, commit: str, link: str, sha256: str
+) -> bool:
+    """Write the four tracker files. Returns True if any file actually changed.
+
+    All four files are always written (creating empty ones if a value is
+    unavailable, e.g. older releases where the API omits `digest`). That keeps
+    the file set self-describing and lets consumer scripts assume the files
+    exist."""
+    files = {
+        f"{prefix}-commit.txt": commit,
+        f"{prefix}-lastbuild.txt": build_date,
+        f"{prefix}-link.txt": link,
+        f"{prefix}-sha256.txt": sha256,
+    }
+    changed = False
+    for name, value in files.items():
+        path = REPO_ROOT / name
+        if not path.exists() or read_text(path) != value:
+            write_text(path, value)
+            changed = True
+    return changed
+
+
+def update_branch(branch: str, releases: list[dict]) -> dict:
+    """Resolve and (maybe) write a numbered Clang-N or Clang-main tracker."""
+    patterns = BRANCH_PATTERNS[branch]
+    pick = best_match(releases, patterns)
+    if pick is None:
         print(f"[{branch}] no matching upstream release found")
         return {"branch": branch, "status": "no-match", "changed": False}
 
-    build_date, rel = best
+    build_date, rel = pick
     tag = rel["tag_name"]
+    asset = pick_clang_asset(rel.get("assets", []) or [])
     commit = extract_llvm_commit(rel.get("body"))
-    link = pick_tarball(rel.get("assets", []) or [])
+    link = asset.get("browser_download_url") if asset else None
+    sha256 = extract_sha256(asset) if asset else None
     published = rel.get("published_at", "")
-
-    if not commit:
-        print(f"[{branch}] {tag}: could not parse llvm commit; skipping")
-        return {
-            "branch": branch, "status": "no-commit", "tag": tag,
-            "changed": False,
-        }
-    if not link:
-        print(f"[{branch}] {tag}: no .tar.gz asset; skipping")
-        return {
-            "branch": branch, "status": "no-asset", "tag": tag,
-            "changed": False,
-        }
-
-    commit_path = REPO_ROOT / f"{branch}-commit.txt"
-    build_path = REPO_ROOT / f"{branch}-lastbuild.txt"
-    link_path = REPO_ROOT / f"{branch}-link.txt"
-
-    current_build = read_text(build_path)
-    current_commit = read_text(commit_path)
-    current_link = read_text(link_path)
 
     summary = {
         "branch": branch,
@@ -213,36 +260,104 @@ def update_branch(branch: str, releases: list[dict]) -> Optional[dict]:
         "build_date": build_date,
         "commit": commit,
         "published": published,
-        "previous_build": current_build,
+        "previous_build": read_text(REPO_ROOT / f"{branch}-lastbuild.txt"),
         "changed": False,
     }
 
-    if (
-        current_build == build_date
-        and current_commit == commit
-        and current_link == link
-    ):
-        print(f"[{branch}] up to date ({tag})")
-        summary["status"] = "up-to-date"
+    if not commit:
+        summary["status"] = "no-commit"
+        print(f"[{branch}] {tag}: could not parse llvm commit; skipping")
         return summary
+    if not link:
+        summary["status"] = "no-asset"
+        print(f"[{branch}] {tag}: no .tar.gz asset; skipping")
+        return summary
+    if not sha256:
+        # API may omit `digest` on very old releases; fall back to empty file.
+        sha256 = ""
 
+    current_build = summary["previous_build"]
     if current_build and current_build > build_date:
+        summary["status"] = "ahead-of-upstream"
         print(
             f"[{branch}] current build {current_build} is newer than upstream "
             f"{build_date}; skipping"
         )
-        summary["status"] = "ahead-of-upstream"
         return summary
 
-    print(
-        f"[{branch}] update -> tag={tag} build={build_date} "
-        f"commit={commit[:12]}"
-    )
-    write_text(commit_path, commit)
-    write_text(build_path, build_date)
-    write_text(link_path, link)
-    summary["status"] = "updated"
-    summary["changed"] = True
+    changed = write_tracker(branch, build_date, commit, link, sha256)
+    summary["status"] = "updated" if changed else "up-to-date"
+    summary["changed"] = changed
+    if changed:
+        print(
+            f"[{branch}] update -> tag={tag} build={build_date} "
+            f"commit={commit[:12]}"
+        )
+    else:
+        print(f"[{branch}] up to date ({tag})")
+    return summary
+
+
+def update_pixel8(
+    alias: str, prefs: list[int], releases: list[dict]
+) -> dict:
+    """Resolve a Pixel 8 alias to the first preferred major that has a release.
+
+    Also writes `Pixel-8-{branch}-clang.txt` containing the chosen LLVM major,
+    so kernel CI can know which clang is actually being fetched.
+    """
+    chosen: Optional[tuple[int, str, dict]] = None  # (major, build_date, rel)
+    for major in prefs:
+        pats = BRANCH_PATTERNS.get(f"Clang-{major}", [])
+        if not pats:
+            pats = [stable_pattern(major), git_pattern(major)]
+        pick = best_match(releases, pats)
+        if pick is not None:
+            chosen = (major, pick[0], pick[1])
+            break
+
+    if chosen is None:
+        print(f"[{alias}] no upstream release for any of {prefs}")
+        return {"branch": alias, "status": "no-match", "changed": False}
+
+    major, build_date, rel = chosen
+    tag = rel["tag_name"]
+    asset = pick_clang_asset(rel.get("assets", []) or [])
+    commit = extract_llvm_commit(rel.get("body"))
+    link = asset.get("browser_download_url") if asset else None
+    sha256 = (extract_sha256(asset) if asset else None) or ""
+    summary = {
+        "branch": alias,
+        "tag": tag,
+        "build_date": build_date,
+        "commit": commit or "",
+        "published": rel.get("published_at", ""),
+        "llvm_major": str(major),
+        "previous_build": read_text(REPO_ROOT / f"{alias}-lastbuild.txt"),
+        "changed": False,
+    }
+
+    if not commit or not link:
+        summary["status"] = "incomplete"
+        print(f"[{alias}] {tag}: missing commit/link; skipping")
+        return summary
+
+    changed = write_tracker(alias, build_date, commit, link, sha256)
+    # Track which LLVM major resolved.
+    major_path = REPO_ROOT / f"{alias}-clang.txt"
+    if read_text(major_path) != str(major):
+        write_text(major_path, str(major))
+        changed = True
+
+    summary["status"] = "updated" if changed else "up-to-date"
+    summary["changed"] = changed
+    if changed:
+        print(
+            f"[{alias}] update -> LLVM {major} ({tag}) build={build_date} "
+            f"commit={commit[:12]}"
+        )
+    else:
+        print(f"[{alias}] up to date (LLVM {major}, {tag})")
     return summary
 
 
@@ -251,27 +366,25 @@ def update_branch(branch: str, releases: list[dict]) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def write_summary(rows: list[dict]) -> None:
-    """Render a Markdown table to $GITHUB_STEP_SUMMARY when present."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
     lines = [
         "## ZyCromerZ/Clang tracker sync",
         "",
-        "| Branch | Status | Tag | Build | Previous | Published |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Branch | Status | LLVM | Tag | Build | Previous | Published |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for r in rows:
-        if r is None:
-            continue
         lines.append(
-            "| {branch} | {status} | {tag} | {build} | {prev} | {pub} |".format(
-                branch=r.get("branch", ""),
-                status=r.get("status", ""),
-                tag=r.get("tag", "-"),
-                build=r.get("build_date", "-"),
-                prev=r.get("previous_build", "-") or "-",
-                pub=(r.get("published") or "-")[:10],
+            "| {b} | {s} | {l} | {t} | {bd} | {pb} | {pd} |".format(
+                b=r.get("branch", ""),
+                s=r.get("status", ""),
+                l=r.get("llvm_major", "-"),
+                t=r.get("tag", "-"),
+                bd=r.get("build_date", "-"),
+                pb=r.get("previous_build") or "-",
+                pd=(r.get("published") or "-")[:10],
             )
         )
     with open(path, "a") as f:
@@ -284,22 +397,32 @@ def write_summary(rows: list[dict]) -> None:
 
 def main() -> int:
     print(f"::group::Fetch releases from {UPSTREAM}")
-    releases = fetch_releases(needed_branches=set(BRANCH_PATTERNS))
+    releases = fetch_releases()
     print(f"Fetched {len(releases)} releases")
     print("::endgroup::")
 
     rows: list[dict] = []
     changed_any = False
+
     for branch in BRANCH_PATTERNS:
         print(f"::group::{branch}")
         try:
             row = update_branch(branch, releases)
         finally:
             print("::endgroup::")
-        if row:
-            rows.append(row)
-            if row.get("changed"):
-                changed_any = True
+        rows.append(row)
+        if row.get("changed"):
+            changed_any = True
+
+    for alias, prefs in PIXEL8_ALIASES.items():
+        print(f"::group::{alias}")
+        try:
+            row = update_pixel8(alias, prefs, releases)
+        finally:
+            print("::endgroup::")
+        rows.append(row)
+        if row.get("changed"):
+            changed_any = True
 
     write_summary(rows)
 
@@ -307,9 +430,7 @@ def main() -> int:
     if gh_out:
         with open(gh_out, "a") as f:
             f.write(f"changed={'true' if changed_any else 'false'}\n")
-            updated = ",".join(
-                r["branch"] for r in rows if r.get("changed")
-            )
+            updated = ",".join(r["branch"] for r in rows if r.get("changed"))
             f.write(f"updated_branches={updated}\n")
 
     print("Done." if not changed_any else "Done. Files updated.")

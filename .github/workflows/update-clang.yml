@@ -45,7 +45,11 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Clang-*-commit.txt Clang-*-lastbuild.txt Clang-*-link.txt
+          git add Clang-*-commit.txt Clang-*-lastbuild.txt Clang-*-link.txt \
+                  Clang-*-sha256.txt \
+                  Pixel-8-*-commit.txt Pixel-8-*-lastbuild.txt \
+                  Pixel-8-*-link.txt Pixel-8-*-sha256.txt \
+                  Pixel-8-*-clang.txt
           if git diff --cached --quiet; then
             echo "No staged changes."
             exit 0
